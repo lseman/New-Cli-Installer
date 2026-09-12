@@ -33,9 +33,7 @@ auto create_group(std::string_view group, std::string_view mountpoint, bool is_s
 }
 
 auto set_user_password(std::string_view username, std::string_view password, std::string_view mountpoint) noexcept -> Result<void> {
-    // Use chpasswd (reads from stdin, uses SHA-512 by default on modern systems)
-    // instead of openssl passwd which defaults to weak DES and exposes plaintext
-    // as a CLI argument.
+    // SHA-512 via chpasswd (stdin) instead of openssl passwd (weak DES, CLI arg)
     const auto& cmd = fmt::format(FMT_COMPILE("echo \"{}:{}\" | chpasswd"), username, password);
     if (!utils::arch_chroot_checked(cmd, mountpoint)) {
         spdlog::error("Failed to set password for user {}", username);
