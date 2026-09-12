@@ -1,31 +1,26 @@
 #include "cachyos/disk_validation.hpp"
 
-// import gucc
 #include "gucc/io_utils.hpp"
 #include "gucc/string_utils.hpp"
 #include "gucc/system_query.hpp"
 
-#include <algorithm>    // for max, min
-#include <charconv>     // for from_chars
-#include <expected>     // for expected
-#include <filesystem>   // for exists, ifstream
-#include <fstream>      // for ifstream
-#include <optional>     // for optional
-#include <ranges>       // for ranges::*
-#include <string>       // for string
-#include <string_view>  // for string_view
-#include <vector>       // for vector
-#include <iterator>     // for back_inserter
+#include <algorithm>  // for max, min
+#include <charconv>   // for from_chars
+#include <expected>   // for expected
+#include <filesystem> // for exists, ifstream
+#include <fstream>    // for ifstream
+#include <ranges>     // for ranges::*
+#include <string_view>// for string_view
 
 #include <fmt/compile.h>
 #include <fmt/format.h>
+#include <spdlog/spdlog.h>
 
 using namespace std::string_view_literals;
 using namespace std::string_literals;
 
 namespace {
 
-/// @brief Convert a string to lowercase (locale-independent).
 constexpr auto to_lower(std::string_view s) noexcept -> std::string {
     std::string result{};
     result.reserve(s.size());
@@ -33,30 +28,28 @@ constexpr auto to_lower(std::string_view s) noexcept -> std::string {
     return result;
 }
 
-}  // namespace
+constexpr auto is_efi_fs(std::string_view fs) noexcept -> bool {
+    const auto f = to_lower(fs);
+    return f == "vfat" || f == "fat32" || f == "fat16";
+}
 
-namespace cachyos::installer {
+constexpr auto is_swap_fs(std::string_view fs) noexcept -> bool {
+    const auto f = to_lower(fs);
+    return f == "linuxswap" || f == "swap";
+}
 
-// ---------------------------------------------------------------------------
-// Size parsing helpers
-// ---------------------------------------------------------------------------
-
-namespace {
-
-/// Suffix multipliers for size strings (binary units).
-constexpr auto kSuffixes = std::array{
+// Suffix multipliers for size strings (longest suffix first).
+constexpr std::array kSuffixes{
     std::pair{"YiB"sv, uint64_t{1} << 60},
     std::pair{"PiB"sv, uint64_t{1} << 50},
     std::pair{"TiB"sv, uint64_t{1} << 40},
     std::pair{"GiB"sv, uint64_t{1} << 30},
     std::pair{"MiB"sv, uint64_t{1} << 20},
     std::pair{"KiB"sv, uint64_t{1} << 10},
-    // Decimal suffixes (SI) — commonly used in practice
     std::pair{"TB"sv,  uint64_t{1000} * 1000 * 1000 * 1000},
     std::pair{"GB"sv,  uint64_t{1000} * 1000 * 1000},
     std::pair{"MB"sv,  uint64_t{1000} * 1000},
     std::pair{"KB"sv,  uint64_t{1000}},
-    // Legacy single-letter (treat as binary)
     std::pair{"P"sv,   uint64_t{1} << 50},
     std::pair{"T"sv,   uint64_t{1} << 40},
     std::pair{"G"sv,   uint64_t{1} << 30},
@@ -64,68 +57,21 @@ constexpr auto kSuffixes = std::array{
     std::pair{"K"sv,   uint64_t{1} << 10},
 };
 
-/// Minimum recommended EFI partition size: 512 MiB.
 constexpr uint64_t kRecommendedEfiSize = 512ULL * 1024 * 1024;
-
-/// Absolute minimum EFI partition size per UEFI spec: 100 MiB.
-constexpr uint64_t kMinimumEfiSize = 100ULL * 1024 * 1024;
-
-}  // namespace
-
-auto parse_size_bytes(std::string_view size_str) noexcept -> std::optional<uint64_t> {
-    if (size_str.empty()) {
-        return std::nullopt;
-    }
-
-    auto trimmed = gucc::utils::trim(size_str);
-
-    // Handle "100%" or empty (fill remaining space) — not a concrete size
-    if (trimmed == "100%" || trimmed.empty()) {
-        return std::nullopt;
-    }
-
-    // Try to find a suffix match from the longest to shortest
-    for (const auto& [suffix, multiplier] : kSuffixes) {
-        if (trimmed.size() >= suffix.size() &&
-            trimmed.substr(trimmed.size() - suffix.size()) == suffix) {
-            auto num_str = trimmed.substr(0, trimmed.size() - suffix.size());
-            uint64_t value{};
-            if (std::from_chars(num_str.data(), num_str.data() + num_str.size(), value).ec == std::errc{}) {
-                // Overflow guard
-                if (value > 0 && multiplier > UINT64_MAX / value) {
-                    return std::nullopt;  // would overflow
-                }
-                return value * multiplier;
-            }
-            break;
-        }
-    }
-
-    // No suffix — treat as raw bytes (sector count for sfdisk, but we interpret as bytes here)
-    uint64_t value{};
-    if (std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), value).ec == std::errc{}) {
-        return value;
-    }
-
-    return std::nullopt;
-}
+constexpr uint64_t kMinimumEfiSize     = 100ULL * 1024 * 1024;
 
 auto get_total_ram_bytes() noexcept -> uint64_t {
     std::ifstream meminfo("/proc/meminfo");
-    if (!meminfo.is_open()) {
-        return 0;
-    }
+    if (!meminfo.is_open()) return 0;
 
     std::string line;
     while (std::getline(meminfo, line)) {
         if (line.starts_with("MemTotal:"s)) {
-            // Format: "MemTotal:       16384000 kB"
             auto pos = line.find(':');
             if (pos == std::string::npos) return 0;
             auto num_str = line.substr(pos + 1);
             uint64_t kb{};
-            if (std::from_chars(num_str.data(), num_str.data() + num_str.size(), kb).ec == std::errc{}) {
-                // Overflow guard for very large systems
+            if (std::from_chars(num_str.data(), num_str.data() + num_str.size(), kb).ec != std::errc{}) {
                 if (kb > UINT64_MAX / 1024) return 0;
                 return kb * 1024;
             }
@@ -135,274 +81,141 @@ auto get_total_ram_bytes() noexcept -> uint64_t {
     return 0;
 }
 
+auto find_partition_size(const std::vector<cachyos::installer::PartitionConfig>& partitions,
+    std::string_view mountpoint) noexcept -> std::optional<uint64_t> {
+    for (const auto& part : partitions) {
+        if (part.mountpoint == mountpoint) {
+            return cachyos::installer::parse_size_bytes(part.size);
+        }
+    }
+    return std::nullopt;
+}
+
+auto find_any_partition(const std::vector<cachyos::installer::PartitionConfig>& partitions,
+    bool (*predicate)(std::string_view)) noexcept -> std::optional<uint64_t> {
+    for (const auto& part : partitions) {
+        if (predicate(part.fs_name)) {
+            return cachyos::installer::parse_size_bytes(part.size);
+        }
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+namespace cachyos::installer {
+
+auto parse_size_bytes(std::string_view size_str) noexcept -> std::optional<uint64_t> {
+    auto trimmed = gucc::utils::trim(size_str);
+    if (trimmed == "100%" || trimmed.empty()) return std::nullopt;
+
+    for (const auto& [suffix, mult] : kSuffixes) {
+        if (trimmed.size() >= suffix.size() &&
+            trimmed.substr(trimmed.size() - suffix.size()) == suffix) {
+            auto num_str = trimmed.substr(0, trimmed.size() - suffix.size());
+            uint64_t value{};
+            if (std::from_chars(num_str.data(), num_str.data() + num_str.size(), value).ec == std::errc{}) {
+                if (value > 0 && mult > UINT64_MAX / value) return std::nullopt;
+                return value * mult;
+            }
+            break;
+        }
+    }
+
+    uint64_t value{};
+    if (std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), value).ec == std::errc{}) {
+        return value;
+    }
+    return std::nullopt;
+}
+
 auto recommend_swap_size(uint64_t ram_bytes) noexcept -> uint64_t {
     constexpr uint64_t one_gib = uint64_t{1} << 30;
 
-    if (ram_bytes < 2 * one_gib) {
-        return 2 * ram_bytes;  // < 2 GiB → 2× RAM
-    } else if (ram_bytes < 8 * one_gib) {
-        return ram_bytes;      // 2–<8 GiB → equal to RAM
-    } else if (ram_bytes < 64 * one_gib) {
-        return std::max(ram_bytes / 2, 4 * one_gib);  // 8–<64 GiB → 0.5× RAM, min 4 GiB
-    } else {
-        return 4 * one_gib;    // ≥ 64 GiB → 4 GiB (or more if hibernation needed)
-    }
+    if (ram_bytes < 2 * one_gib) return 2 * ram_bytes;
+    if (ram_bytes < 8 * one_gib) return ram_bytes;
+    if (ram_bytes < 64 * one_gib) return std::max(ram_bytes / 2, 4 * one_gib);
+    return 4 * one_gib;
 }
 
-// ---------------------------------------------------------------------------
-// Validation report formatting
-// ---------------------------------------------------------------------------
-
-auto DiskValidationReport::to_string() const -> std::string {
-    std::string out{};
-
-    out += fmt::format(FMT_COMPILE("=== Disk Space Pre-Validation ===\n"));
-    out += fmt::format(FMT_COMPILE("Target device: {}\n"), device);
-
-    if (total_disk_bytes > 0) {
-        out += fmt::format(FMT_COMPILE("Disk capacity: {} ({:.2f} GiB)\n"),
-            gucc::disk::format_size(total_disk_bytes),
-            static_cast<double>(total_disk_bytes) / (1ULL << 30));
-    }
-
-    if (!checks.empty()) {
-        out += fmt::format(FMT_COMPILE("\n--- Partition Size Checks ---\n"));
-        out += fmt::format(FMT_COMPILE("{:<20} {:<15} {:<15} {:<8}\n"),
-            "Partition", "Available", "Required", "Status");
-        out += std::string(60, '-') + "\n";
-
-        for (const auto& check : checks) {
-            const auto status = check.fits ? "OK" : "FAIL";
-            out += fmt::format(FMT_COMPILE("{:<20} {:<15} {:<15} {}\n"),
-                check.partition,
-                gucc::disk::format_size(check.available),
-                gucc::disk::format_size(check.required),
-                status);
-        }
-    }
-
-    if (!errors.empty()) {
-        out += fmt::format(FMT_COMPILE("\n--- ERRORS (installation blocked) ---\n"));
-        for (const auto& err : errors) {
-            out += fmt::format(FMT_COMPILE("  ✗ {}\n"), err);
-        }
-    }
-
-    if (!warnings.empty()) {
-        out += fmt::format(FMT_COMPILE("\n--- WARNINGS (installation can proceed) ---\n"));
-        for (const auto& warn : warnings) {
-            out += fmt::format(FMT_COMPILE("  ⚠ {}\n"), warn);
-        }
-    }
-
-    const auto verdict = is_valid ? "PASS" : "FAIL";
-    out += fmt::format(FMT_COMPILE("\nVerdict: {}\n"), verdict);
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// Main validation entry point
-// ---------------------------------------------------------------------------
-
-auto validate_disk_space(const InstallerConfig& config, bool is_efi) noexcept -> DiskValidationReport {
-    DiskValidationReport report{};
-    report.device = config.device.has_value() ? *config.device : "<not specified>"s;
-
-    // Get disk info from the live environment
-    const auto disk_info = gucc::disk::get_disk_info(report.device);
+auto validate_disk_space(const InstallerConfig& config, bool is_efi) noexcept -> std::expected<void, std::string> {
+    const auto disk_info = gucc::disk::get_disk_info(config.device.value_or("<not specified>"s));
     if (!disk_info) {
-        report.is_valid     = false;
-        report.errors.emplace_back(fmt::format("Cannot read disk info for '{}'. Is the device present?", report.device));
-        return report;
+        return std::unexpected(fmt::format("Cannot read disk info for '{}'. Is the device present?", config.device.value_or("<not specified>"s)));
     }
 
-    report.total_disk_bytes = disk_info->size;
-
-    if (report.total_disk_bytes == 0) {
-        report.is_valid     = false;
-        report.errors.emplace_back(fmt::format("Disk '{}' reports zero size — cannot validate", report.device));
-        return report;
+    const uint64_t disk_size = disk_info->size;
+    if (disk_size == 0) {
+        return std::unexpected(fmt::format("Disk '{}' reports zero size", config.device.value_or("<unknown>"s)));
     }
 
-    // -----------------------------------------------------------------------
-    // Phase 1: Validate each explicitly-sized partition against disk capacity
-    // -----------------------------------------------------------------------
+    // Phase 1: check each explicitly-sized partition fits on disk.
     uint64_t explicit_total{};
-
     for (const auto& part : config.partitions) {
-        SizeCheckResult check{};
-        check.partition = fmt::format("{} ({})", part.mountpoint, part.type == PartitionType::Root ? "root" :
-            (part.type == PartitionType::Boot ? "boot" : "additional"));
+        const auto size = cachyos::installer::parse_size_bytes(part.size);
+        if (!size) continue;
 
-        const auto size_opt = parse_size_bytes(part.size);
-        if (!size_opt) {
-            // No explicit size — this partition will fill remaining space. Skip check.
-            continue;
+        if (*size > disk_size) {
+            return std::unexpected(fmt::format("Partition '{}' requires {} but disk is only {}",
+                part.mountpoint, gucc::disk::format_size(*size), gucc::disk::format_size(disk_size)));
         }
-
-        const uint64_t size = *size_opt;
-        check.required      = size;
-        check.available     = report.total_disk_bytes;
-        check.fits          = (size <= report.total_disk_bytes);
-
-        if (!check.fits) {
-            check.message = fmt::format("Partition '{}' requires {} but disk is only {}",
-                check.partition, gucc::disk::format_size(size), gucc::disk::format_size(report.total_disk_bytes));
-            report.checks.emplace_back(std::move(check));
-            report.is_valid     = false;
-            report.errors.emplace_back(std::move(check.message));
-            continue;
-        }
-
-        explicit_total += size;
-        check.message   = fmt::format("{} of {} available", gucc::disk::format_size(size), gucc::disk::format_size(report.total_disk_bytes));
-        report.checks.emplace_back(std::move(check));
+        explicit_total += *size;
     }
 
-    // -----------------------------------------------------------------------
-    // Phase 2: Check total explicit sizes don't exceed disk capacity
-    // -----------------------------------------------------------------------
-    report.used_by_partitions = explicit_total;
-    report.remaining_bytes    = report.total_disk_bytes - explicit_total;
-
-    if (explicit_total > report.total_disk_bytes) {
-        const auto overage = explicit_total - report.total_disk_bytes;
-        report.is_valid     = false;
-        report.errors.emplace_back(fmt::format(
-            "Total explicit partition sizes ({}) exceed disk capacity ({}) by {}",
-            gucc::disk::format_size(explicit_total),
-            gucc::disk::format_size(report.total_disk_bytes),
-            gucc::disk::format_size(overage)));
+    // Phase 2: total explicit sizes must not exceed disk.
+    if (explicit_total > disk_size) {
+        return std::unexpected(fmt::format("Total partition sizes ({}) exceed disk capacity ({})",
+            gucc::disk::format_size(explicit_total), gucc::disk::format_size(disk_size)));
     }
 
-    // -----------------------------------------------------------------------
-    // Phase 3: EFI partition size adequacy (UEFI only)
-    // -----------------------------------------------------------------------
+    const auto remaining = disk_size - explicit_total;
+
+    // Phase 3: EFI partition size check.
     if (is_efi) {
-        uint64_t efi_size{};
-        bool has_efi = false;
-
-        for (const auto& part : config.partitions) {
-            const auto fs_lower = to_lower(part.fs_name);
-            if (fs_lower == "vfat" || fs_lower == "fat32" || fs_lower == "fat16") {
-                has_efi = true;
-                if (const auto sz = parse_size_bytes(part.size); sz) {
-                    efi_size = *sz;
-                }
-                break;
-            }
+        const auto efi_size = find_any_partition(config.partitions, is_efi_fs);
+        if (!efi_size) {
+            return std::unexpected("UEFI system detected but no EFI (vfat) partition found");
         }
 
-        // Also check the config-level fs_name for EFI scenarios
-        if (!has_efi && config.fs_name) {
-            const auto fs_lower = to_lower(*config.fs_name);
-            if (fs_lower == "vfat" || fs_lower == "fat32" || fs_lower == "fat16") {
-                has_efi = true;
-                efi_size = report.total_disk_bytes;  // EFI takes whole partition
-            }
+        if (*efi_size < kMinimumEfiSize) {
+            return std::unexpected(fmt::format("EFI partition is {} — minimum required is {}",
+                gucc::disk::format_size(*efi_size), gucc::disk::format_size(kMinimumEfiSize)));
         }
-
-        if (has_efi) {
-            SizeCheckResult efi_check{};
-            efi_check.partition   = "/boot/efi (ESP)";
-            efi_check.required    = kMinimumEfiSize;
-            efi_check.available   = efi_size;
-            efi_check.fits        = (efi_size >= kMinimumEfiSize);
-
-            if (!efi_check.fits) {
-                efi_check.message = fmt::format(
-                    "EFI partition is {} — minimum required is {} (UEFI spec). Install may fail.",
-                    gucc::disk::format_size(efi_size), gucc::disk::format_size(kMinimumEfiSize));
-                report.checks.emplace_back(std::move(efi_check));
-                report.is_valid     = false;
-                report.errors.emplace_back(std::move(efi_check.message));
-            } else if (efi_size < kRecommendedEfiSize) {
-                efi_check.message = fmt::format(
-                    "EFI partition is {} — meets minimum but {} is recommended for multiple bootloaders.",
-                    gucc::disk::format_size(efi_size), gucc::disk::format_size(kRecommendedEfiSize));
-                report.checks.emplace_back(std::move(efi_check));
-                report.warnings.emplace_back(std::move(efi_check.message));
-            } else {
-                efi_check.message = fmt::format("EFI partition size ({}) is adequate", gucc::disk::format_size(efi_size));
-                report.checks.emplace_back(std::move(efi_check));
-            }
-        } else if (is_efi) {
-            // No EFI partition found in config — this might be caught elsewhere, but flag it
-            report.warnings.emplace_back("UEFI system detected but no EFI (vfat) partition found in config");
+        if (*efi_size < kRecommendedEfiSize) {
+            spdlog::warn("EFI partition is {} — meets minimum but {} recommended",
+                gucc::disk::format_size(*efi_size), gucc::disk::format_size(kRecommendedEfiSize));
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Phase 4: Swap size relative to RAM
-    // -----------------------------------------------------------------------
+    // Phase 4: swap size check.
     const uint64_t ram_bytes = get_total_ram_bytes();
     if (ram_bytes > 0) {
         const auto recommended_swap = recommend_swap_size(ram_bytes);
+        const auto swap_size = find_any_partition(config.partitions, is_swap_fs);
 
-        // Check configured swap
-        bool has_swap = false;
-        uint64_t swap_size{};
-
-        for (const auto& part : config.partitions) {
-            const auto fs_lower = to_lower(part.fs_name);
-            if (fs_lower == "linuxswap" || fs_lower == "swap") {
-                has_swap = true;
-                if (const auto sz = parse_size_bytes(part.size); sz) {
-                    swap_size = *sz;
-                }
-                break;
-            }
-        }
-
-        // Also check encrypt_swap flag — it implies a swap partition will be created
-        const bool swap_encrypted = config.encrypt_swap && config.device.has_value();
-
-        if (has_swap) {
-            SizeCheckResult swap_check{};
-            swap_check.partition   = "swap";
-            swap_check.required    = recommended_swap;
-            swap_check.available   = swap_size;
-            swap_check.fits        = (swap_size >= recommended_swap / 2);  // allow 50% tolerance
-
-            if (!swap_check.fits) {
-                swap_check.message = fmt::format(
-                    "Swap partition ({}) is smaller than recommended ({}) for {} RAM. Consider increasing.",
-                    gucc::disk::format_size(swap_size),
+        if (swap_size) {
+            if (*swap_size < recommended_swap / 2) {
+                spdlog::warn("Swap ({}) is smaller than recommended ({}) for {} RAM",
+                    gucc::disk::format_size(*swap_size),
                     gucc::disk::format_size(recommended_swap),
                     gucc::disk::format_size(ram_bytes));
-                report.checks.emplace_back(std::move(swap_check));
-                report.warnings.emplace_back(std::move(swap_check.message));
-            } else {
-                swap_check.message = fmt::format("Swap size ({}) is adequate for {} RAM",
-                    gucc::disk::format_size(swap_size), gucc::disk::format_size(ram_bytes));
-                report.checks.emplace_back(std::move(swap_check));
             }
-        } else if (swap_encrypted) {
-            // Swap will be created as a partition — no size check needed, it'll use the device
-            report.warnings.emplace_back("encrypt_swap is enabled but no swap partition defined; swap will be created on the target device");
-        } else if (!config.allow_auto_partition && !config.partitions.empty()) {
-            // User provided explicit partitions but no swap — warn for systems with > 4 GiB RAM
-            if (ram_bytes > 4ULL * (1ULL << 30)) {
-                report.warnings.emplace_back(fmt::format(
-                    "No swap partition defined. {} RAM detected — consider adding a swap partition.",
-                    gucc::disk::format_size(ram_bytes)));
-            }
+        } else if (config.encrypt_swap && config.device.has_value()) {
+            spdlog::info("encrypt_swap enabled — swap will be created on target device");
+        } else if (!config.allow_auto_partition && !config.partitions.empty() && ram_bytes > 4ULL * (1ULL << 30)) {
+            spdlog::warn("No swap partition defined. {} RAM detected — consider adding one",
+                gucc::disk::format_size(ram_bytes));
         }
     } else {
-        // Could not read RAM info — skip swap validation
-        report.warnings.emplace_back("Could not read system RAM (/proc/meminfo unreadable) — swap size check skipped");
+        spdlog::info("Could not read /proc/meminfo — skipping swap validation");
     }
 
-    // -----------------------------------------------------------------------
-    // Phase 5: Remaining space sanity check
-    // -----------------------------------------------------------------------
-    if (report.remaining_bytes < 1ULL << 30) {  // less than 1 GiB remaining
-        report.warnings.emplace_back(fmt::format(
-            "Only {} remaining after explicit partitions — root partition will have minimal space",
-            gucc::disk::format_size(report.remaining_bytes)));
+    // Phase 5: remaining space sanity check.
+    if (remaining < 1ULL << 30) {
+        spdlog::warn("Only {} remaining after explicit partitions", gucc::disk::format_size(remaining));
     }
 
-    return report;
+    return {};
 }
 
 }  // namespace cachyos::installer

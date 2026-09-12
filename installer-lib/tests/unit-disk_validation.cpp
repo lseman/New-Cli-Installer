@@ -3,6 +3,7 @@
 #include "cachyos/disk_validation.hpp"
 #include "cachyos/installer_config.hpp"
 
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -14,11 +15,14 @@ using namespace std::string_literals;
 using namespace std::string_view_literals;
 
 using cachyos::installer::parse_size_bytes;
-using cachyos::installer::get_total_ram_bytes;
 using cachyos::installer::recommend_swap_size;
 using cachyos::installer::validate_disk_space;
 using cachyos::installer::InstallerConfig;
-using cachyos::installer::DiskValidationReport;
+
+static auto setup_test_logger() noexcept -> void {
+    auto sink = std::make_shared<spdlog::sinks::callback_sink_mt>([](const spdlog::details::log_msg&) {});
+    spdlog::set_default_logger(std::make_shared<spdlog::logger>("test", sink));
+}
 
 TEST_CASE("size parsing — binary suffixes")
 {
@@ -72,13 +76,12 @@ TEST_CASE("swap size recommendation — 2–<8 GiB RAM")
 TEST_CASE("swap size recommendation — 8–<64 GiB RAM")
 {
     constexpr uint64_t one_gib = uint64_t{1} << 30;
-    // 8 GiB → 0.5× = 4 GiB (meets minimum)
     REQUIRE_EQ(recommend_swap_size(8 * one_gib), 4 * one_gib);
     REQUIRE_EQ(recommend_swap_size(16 * one_gib), 8 * one_gib);
     REQUIRE_EQ(recommend_swap_size(32 * one_gib), 16 * one_gib);
 }
 
-TEST_CASE("swap size recommendation — ≥ 64 GiB RAM")
+TEST_CASE("swap size recommendation — >= 64 GiB RAM")
 {
     constexpr uint64_t one_gib = uint64_t{1} << 30;
     REQUIRE_EQ(recommend_swap_size(64 * one_gib), 4 * one_gib);
@@ -87,47 +90,22 @@ TEST_CASE("swap size recommendation — ≥ 64 GiB RAM")
 
 TEST_CASE("validate_disk_space — no device specified")
 {
-    // Set up a noop logger for tests
-    auto callback_sink = std::make_shared<spdlog::sinks::callback_sink_mt>([](const spdlog::details::log_msg&) {});
-    auto logger        = std::make_shared<spdlog::logger>("default", callback_sink);
-    spdlog::set_default_logger(logger);
-
+    setup_test_logger();
     InstallerConfig config{};
     config.headless_mode = true;
-    // No device set
+    // No device set — should fail with error about missing device
 
-    const auto report = validate_disk_space(config, false);
-    REQUIRE(!report.is_valid);
-    REQUIRE(!report.errors.empty());
+    const auto result = validate_disk_space(config, false);
+    REQUIRE(!result);
 }
 
 TEST_CASE("validate_disk_space — nonexistent device")
 {
-    auto callback_sink = std::make_shared<spdlog::sinks::callback_sink_mt>([](const spdlog::details::log_msg&) {});
-    auto logger        = std::make_shared<spdlog::logger>("default", callback_sink);
-    spdlog::set_default_logger(logger);
-
+    setup_test_logger();
     InstallerConfig config{};
     config.headless_mode = true;
     config.device = "/dev/nonexistent_disk_xyz";
 
-    const auto report = validate_disk_space(config, false);
-    REQUIRE(!report.is_valid);
-    REQUIRE(!report.errors.empty());
-}
-
-TEST_CASE("DiskValidationReport::to_string")
-{
-    auto callback_sink = std::make_shared<spdlog::sinks::callback_sink_mt>([](const spdlog::details::log_msg&) {});
-    auto logger        = std::make_shared<spdlog::logger>("default", callback_sink);
-    spdlog::set_default_logger(logger);
-
-    DiskValidationReport report{};
-    report.device       = "/dev/sda";
-    report.total_disk_bytes = 500ULL * 1024 * 1024 * 1024;  // 500 GiB
-    report.is_valid     = true;
-
-    const auto summary = report.to_string();
-    REQUIRE(summary.find("/dev/sda") != std::string::npos);
-    REQUIRE(summary.find("PASS") != std::string::npos);
+    const auto result = validate_disk_space(config, false);
+    REQUIRE(!result);
 }
