@@ -17,6 +17,7 @@ add_library(${PROJECT_NAME}
    src/config.cpp include/cachyos/config.hpp
    src/disk.cpp include/cachyos/disk.hpp
    src/disk_validation.cpp include/cachyos/disk_validation.hpp
+   src/checkpoint.cpp include/cachyos/checkpoint.hpp
    src/packages.cpp include/cachyos/packages.hpp
    src/bootloader.cpp include/cachyos/bootloader.hpp
    src/crypto.cpp include/cachyos/crypto.hpp

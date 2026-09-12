@@ -23,11 +23,15 @@ namespace cachyos::installer {
 ///
 /// Cancel checks run between every step, and any subprocess in flight
 /// at that time receives SIGTERM.
+///
+/// @param resume_from Step index to start from (0-based). If >= 0, steps
+///                    before this index are skipped. Use with checkpoint system.
 [[nodiscard]] auto run(InstallContext& ctx,
     const SystemSettings& sys,
     const UserSettings& user,
     std::string_view root_password,
-    const InstallSession& session) noexcept -> ValidationResult;
+    const InstallSession& session,
+    int resume_from = -1) noexcept -> ValidationResult;
 
 }  // namespace cachyos::installer
 
