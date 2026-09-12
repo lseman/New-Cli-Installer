@@ -4,8 +4,7 @@
 #include <cstdio>   // for feof, fgets, pclose, perror, popen
 #include <cstdlib>  // for exit, WIFEXITED, WIFSIGNALED
 
-#include <algorithm>  // for remove_if
-#include <fstream>    // for ifstream, ofstream
+#include <fstream>  // for ifstream, ofstream
 
 #include <spdlog/spdlog.h>
 
